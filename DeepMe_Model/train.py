@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import os
 import joblib
 from config import *
-
+from sklearn.model_selection import KFold
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
@@ -244,7 +244,6 @@ def train_model(model, train_loader, val_loader, epochs, patience):
 
 def main():
 
-
     print(f"Training configuration:")
     print(f"  Data file: {DATA_FILE}")
     print(f"  Target column: {TARGET_COL}")
@@ -254,66 +253,83 @@ def main():
 
     sequences, labels, feature_cols, train_stats = load_and_preprocess_data(DATA_FILE)
 
-
     joblib.dump(feature_cols, 'feature_columns.pkl')
     joblib.dump(train_stats, 'train_stats.pkl')
     print("Saved feature columns and standardization statistics")
 
 
-    dataset = TimeSeriesDataset(sequences, labels)
+    kf = KFold(n_splits=5, shuffle=True, random_state=SEED)
+    fold_id = 1
+
+    all_fold_val_losses = []
+
+    for train_index, val_index in kf.split(sequences):
+        print("\n" + "="*60)
+        print(f"Starting Fold {fold_id}/5")
+        print("="*60)
+
+        X_train, X_val = sequences[train_index], sequences[val_index]
+        y_train, y_val = labels[train_index], labels[val_index]
+
+        train_dataset = TimeSeriesDataset(X_train, y_train)
+        val_dataset = TimeSeriesDataset(X_val, y_val)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=True
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=BATCH_SIZE * 2,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True
+        )
 
 
-    val_size = int(len(dataset) * VAL_SPLIT)
-    train_size = len(dataset) - val_size
+        num_features = len(feature_cols)
+        model = TimeSeriesBERT(
+            num_features=num_features,
+            seq_length=SEQ_LENGTH,
+            hidden_size=HIDDEN_SIZE,
+            num_layers=NUM_LAYERS
+        )
+
+        print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
 
-    train_dataset = torch.utils.data.Subset(dataset, range(0, train_size))
-    val_dataset = torch.utils.data.Subset(dataset, range(train_size, len(dataset)))
-
-    print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
-
-
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=True
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE * 2,
-        shuffle=False,
-        num_workers=0,
-        pin_memory=True
-    )
+        history = train_model(
+            model,
+            train_loader,
+            val_loader,
+            epochs=EPOCHS,
+            patience=PATIENCE
+        )
 
 
-    num_features = len(feature_cols)
-    model = TimeSeriesBERT(
-        num_features=num_features,
-        seq_length=SEQ_LENGTH,
-        hidden_size=HIDDEN_SIZE,
-        num_layers=NUM_LAYERS
-    )
+        fold_best_loss = min(history["val_loss"])
+        all_fold_val_losses.append(fold_best_loss)
 
 
+        fold_model_path = f"best_model_fold{fold_id}.pth"
+        torch.save(model.state_dict(), fold_model_path)
+        print(f"[Fold {fold_id}] Best Val Loss = {fold_best_loss:.6f}, Saved to {fold_model_path}")
 
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-
-
-    history = train_model(
-        model,
-        train_loader,
-        val_loader,
-        epochs=EPOCHS,
-        patience=PATIENCE
-    )
+        fold_id += 1
 
 
-    torch.save(model.state_dict(), 'final_model.pth')
-    print("Final model saved")
+    print("\n" + "="*60)
+    print("5-Fold Cross-Validation completed!")
+    print("Fold Validation Losses:")
+    for i, loss in enumerate(all_fold_val_losses, 1):
+        print(f"  Fold {i}: {loss:.6f}")
+
+    print(f"\nAverage Val Loss: {np.mean(all_fold_val_losses):.6f}")
+    print("="*60)
 
 
 if __name__ == "__main__":
